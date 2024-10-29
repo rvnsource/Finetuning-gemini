@@ -1,4 +1,3 @@
-# %%
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -19,7 +18,7 @@ from sklearn.model_selection import train_test_split
 from vertexai.generative_models import GenerationConfig, HarmCategory, HarmBlockThreshold, GenerativeModel
 import backoff
 
-# %%
+
 #######################
 # Initialize Vertex AI
 #######################
@@ -28,9 +27,6 @@ PROJECT_ID = "genai-434714"  # @param {type:"string"}
 LOCATION = "us-central1"  # @param {type:"string"}
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
-
-
-# %%
 #############################
 # Load and split the dataset
 #############################
@@ -38,10 +34,6 @@ bbc_datasets = load_dataset("SetFit/bbc-news")
 
 train = pd.DataFrame(bbc_datasets["train"])
 test = pd.DataFrame(bbc_datasets["test"])
-
-# Remove the row containing the specified text
-text_to_remove = "jackson film  absolute disaster  a pr expert has told the michael jackson child abuse trial that the tv"
-test = test[~test['text'].str.contains(text_to_remove, na=False)]
 
 print(f"Training Dataset head: \n {train.head()}")
 print(f"Testing Dataset head: \n {test.head()}")
@@ -59,9 +51,46 @@ print(f"Validation Dataset Labels' count: {val.label_text.value_counts()}")
 print(f"Testing Dataset Lables' count: {test.label_text.value_counts()}")
 
 
+###################
+# Experiment Setup
+###################
+class VertexAIExperimentManager:
+
+    def __init__(self, project: str, location: str):
+        self.project = project
+        self.location = location
+        self.current_experiment = None
+
+    def init_experiment(self, experiment_name: str, experiment_description: Optional[str] = None):
+        self.current_experiment = experiment_name
+        aiplatform.init(
+            experiment=experiment_name,
+            experiment_description=experiment_description,
+            experiment_tensorboard=False,
+            project=self.project,
+            location=self.location)
+
+    def create_experiment(self, experiment_name: str, experiment_description: Optional[str] = None):
+        self.init_experiment(experiment_name, experiment_description)
+
+    def log_run(self, run_name: str, params: Dict[str, Any], metrics: Dict[str, Any]) -> None:
+        if not self.current_experiment:
+            raise ValueError("Experiment not initialized")
+
+        aiplatform.start_run(run=run_name)
+        aiplatform.log_params(params)
+        aiplatform.log_metrics(metrics)
+        aiplatform.end_run()
+
+EXPERIMENT_NAME = "student-experiment-1342"
+experiment_manager = VertexAIExperimentManager(project=PROJECT_ID, location=LOCATION)
+experiment_manager.create_experiment(
+    experiment_name=EXPERIMENT_NAME,
+    experiment_description="Gemini Fine Tuning demo experiment"
+)
 
 
-# %%
+print("Done")
 
 system_prompt_zero_shot = """TASK:
 Classify the text into ONLY one of the following classes [business, entertainment, politics, sport, tech].
@@ -81,6 +110,167 @@ INSTRUCTIONS
 
 """
 
+
+
+######################
+# Model Configuration
+######################
+generation_config = GenerationConfig(max_output_tokens=10, temperature=0)
+safety_settings = {
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+}
+
+gem_pro_1_model_zero = GenerativeModel(
+    "gemini-1.0-pro-002",  # e.g. gemini-1.5-pro-001, gemini-1.5-flash-001
+    system_instruction=[system_prompt_zero_shot],
+    generation_config=generation_config,
+    safety_settings=safety_settings,
+)
+
+####################################################
+# Utility Function: Batch Prediction (Parallelism)
+####################################################
+
+def backoff_hdlr(details) -> None:
+    print(f"Backing off {details['wait']} seconds after {details['tries']} tries.")
+
+def log_error(msg: str, *args: Any):
+    mp.get_logger().error(msg, *args)
+    raise Exception(msg)
+
+def handle_exception_threading(f: Callable) -> Callable:
+    def applicator(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except:
+            log_error(traceback.format_exc())
+
+    return applicator
+
+@handle_exception_threading
+@backoff.on_exception(
+    backoff.expo, ResourceExhausted, max_tries=30, on_backoff=backoff_hdlr
+)
+def _predict_message(message: str, model: GenerativeModel) -> Optional[str]:
+    response = model.generate_content([message], stream=False)
+
+    # TODO: Take care of LLM safety aspects
+    response_dict = response.to_dict()
+
+    # Check if "prompt_feedback" exists and has the key "block_reason"
+    try:
+        prompt_feedback = response_dict.get("prompt_feedback", {})
+        block_reason = prompt_feedback.get("block_reason")
+
+        if block_reason == "PROHIBITED_CONTENT":
+            # Handle the case for prohibited content
+            print("Block Reason: ", response.prompt_feedback.block_reason_message)
+            print("Message: ", message)
+            return response.prompt_feedback.block_reason_message
+        else:
+            # Handle other cases or continue processing
+            return response.text
+    except Exception as e:
+        # Log the exception or handle errors accordingly
+        print(f"An error occurred: {e}")
+
+
+def batch_predict(
+        messages: List[str],
+        model: GenerativeModel,
+        max_workers: int = 4
+) -> List[Optional[str]]:
+
+    predictions = list()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        partial_func = partial(_predict_message, model=model)
+        for prediction in tqdm(pool.map(partial_func, messages), total=len(messages)):
+            predictions.append(prediction)
+
+    return predictions
+
+
+def predictions_postprocessing(text: str) -> str:
+    return text.strip().lower()
+
+def evaluate_predictions(
+    df: pd.DataFrame,
+    target_column: str = "label_text",
+    prediction_column: str = "prediction_labels",
+    postprocessing: bool = True,
+) -> Dict[str, float]:
+
+    if postprocessing:
+        df[prediction_column] = df[prediction_column].fillna("").apply(predictions_postprocessing)
+        df[prediction_column] = df[prediction_column].apply(predictions_postprocessing)
+
+    y_true = df[target_column]
+    y_pred = df[prediction_column]
+
+    metrics_report = classification_report(y_true, y_pred, output_dict=True)
+    overall_macro_f1_score = f1_score(y_true, y_pred, average="macro")
+    overall_micro_f1_score = f1_score(y_true, y_pred, average="micro")
+    weighted_precision = precision_score(y_true, y_pred, average="weighted")
+    weighted_recall = recall_score(y_true, y_pred, average="weighted")
+
+    metrics = {
+        "accuracy": metrics_report["accuracy"],
+        "weighted precision": weighted_precision,
+        "weighted recall": weighted_recall,
+        "macro f1 score": overall_macro_f1_score,
+        "micro f1 score": overall_micro_f1_score
+    }
+
+    categories = ["business", "entertainment", "politics", "sport", "tech"]
+    for category in categories:
+        if category in metrics_report:
+            metrics[f"{category}_f1_score"] = metrics_report[category]["f1-score"]
+
+    return metrics
+
+
+
+#######################################################################
+messages_to_predict = test["text"].to_list()
+predictions_zero_shot = batch_predict(
+    messages=messages_to_predict, model=gem_pro_1_model_zero, max_workers=4
+)
+
+print(predictions_zero_shot)
+
+# Create an Evaluation dataframe to store the predictions for all the experiments.
+df_evals = test.copy()
+df_evals["gem1.0-zero-shot_predictions"] = predictions_zero_shot
+
+# Compute Evaluation Metrics for zero-shot prompt
+metrics_zero_shot = evaluate_predictions(
+    df_evals.copy(),
+    target_column = "label_text",
+    prediction_column = "gem1.0-zero-shot_predictions",
+    postprocessing = True
+)
+print(metrics_zero_shot)
+
+# Log Experiment with zero-shot prompt with Gemini 1.0 pro
+params = {
+    "model": "gemini-1.0-pro-002",
+    "adaptation_type": "in-context zero-shot",
+    "temperature": 0,
+    "max_output_tokens": 10,
+}
+
+experiment_manager.log_run(
+    run_name="ravi1-gemini-1-0-pro-002-zero-shot",
+    params=params,
+    metrics=metrics_zero_shot
+)
+
+
+################################### Second Run using Few Shot prompt ###########################
 system_prompt_few_shot = f"""TASK:
 Classify the text into ONLY one of the following classes [business, entertainment, politics, sport, tech].
 
@@ -130,162 +320,39 @@ EXAMPLES:
 
 """
 
-
-
-# %%
-######################
-# Model Configuration
-######################
-generation_config = GenerationConfig(max_output_tokens=10, temperature=0)
-safety_settings = {
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-}
-
-gem_pro_1_model_zero = GenerativeModel(
+gem_pro_1_model_few = GenerativeModel(
     "gemini-1.0-pro-002",  # e.g. gemini-1.5-pro-001, gemini-1.5-flash-001
-    system_instruction=[system_prompt_zero_shot],
+    system_instruction=[system_prompt_few_shot],
     generation_config=generation_config,
     safety_settings=safety_settings,
 )
 
-
-
-# %%
-####################################################
-# Utility Function: Batch Prediction (Parallelism)
-####################################################
-
-def backoff_hdlr(details) -> None:
-    print(f"Backing off {details['wait']} seconds after {details['tries']} tries.")
-
-def log_error(msg: str, *args: Any):
-    mp.get_logger().error(msg, *args)
-    raise Exception(msg)
-
-def handle_exception_threading(f: Callable) -> Callable:
-    def applicator(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except:
-            log_error(traceback.format_exc())
-
-    return applicator
-
-@handle_exception_threading
-@backoff.on_exception(
-    backoff.expo, ResourceExhausted, max_tries=30, on_backoff=backoff_hdlr
+predictions_few_shot = batch_predict(
+    messages=messages_to_predict, model=gem_pro_1_model_few, max_workers=4
 )
-def _predict_message(message: str, model: GenerativeModel) -> Optional[str]:
-    response = model.generate_content([message], stream=False)
+print(predictions_few_shot)
 
-    # TODO: Take care of LLM safety aspects
-    response_dict = response.to_dict()
-
-    # Check if "prompt_feedback" exists and has the key "block_reason"
-    try:
-        prompt_feedback = response_dict.get("prompt_feedback", {})
-        block_reason = prompt_feedback.get("block_reason")
-
-        if block_reason == "PROHIBITED_CONTENT":
-            # Handle the case for prohibited content
-            print("Block Reason: ", response.prompt_feedback.block_reason_message)
-            print("Message: ", message)
-            return response.prompt_feedback.block_reason_message
-        else:
-            # Handle other cases or continue processing
-            return response.text
-    except Exception as e:
-        # Log the exception or handle errors accordingly
-        print(f"An error occurred: {e}")
-
-def batch_predict(
-        messages: List[str],
-        model: GenerativeModel,
-        max_workers: int = 4
-) -> List[Optional[str]]:
-
-    predictions = list()
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        partial_func = partial(_predict_message, model=model)
-        for prediction in tqdm(pool.map(partial_func, messages), total=len(messages)):
-            predictions.append(prediction)
-
-    return predictions
-
-
-def predictions_postprocessing(text: str) -> str:
-    return text.strip().lower()
-
-def evaluate_predictions(
-    df: pd.DataFrame,
-    target_column: str = "label_text",
-    prediction_column: str = "prediction_labels",
-    postprocessing: bool = True,
-) -> Dict[str, float]:
-
-    if postprocessing:
-        df[prediction_column] = df[prediction_column].apply(predictions_postprocessing)
-
-    y_true = df[target_column]
-    y_pred = df[prediction_column]
-
-    metrics_report = classification_report(y_true, y_pred, output_dict=True)
-    overall_macro_f1_score = f1_score(y_true, y_pred, average="macro")
-    overall_micro_f1_score = f1_score(y_true, y_pred, average="micro")
-    weighted_precision = precision_score(y_true, y_pred, average="weighted")
-    weighted_recall = recall_score(y_true, y_pred, average="weighted")
-
-    metrics = {
-        "accuracy": metrics_report["accuracy"],
-        "weighted precision": weighted_precision,
-        "weighted recall": weighted_recall,
-        "macro f1 score": overall_macro_f1_score,
-        "micro f1 score": overall_micro_f1_score
-    }
-
-    categories = ["business", "entertainment", "politics", "sport", "tech"]
-    for category in categories:
-        if category in metrics_report:
-            metrics[f"{category}_f1_score"] = metrics_report[category]["f1-score"]
-
-    return metrics
-
-
-
-#######################################################################
-
-
-# %%
-messages_to_predict = test["text"].to_list()
-
-# %%
-
-predictions_zero_shot = batch_predict(
-    messages=messages_to_predict, model=gem_pro_1_model_zero, max_workers=4
-)
-
-print(predictions_zero_shot)
-
-
-
-# %%
-# Create an Evaluation dataframe to store the predictions for all the experiments.
-df_evals = test.copy()
-df_evals["gem1.0-zero-shot_predictions"] = predictions_zero_shot
-
-# Compute Evaluation Metrics for zero-shot prompt
-metrics_zero_shot = evaluate_predictions(
+df_evals["gem1.0-few-shot_predictions"] = predictions_few_shot
+print(f"Total few shot predictions: {len(predictions_few_shot)}")
+metrics_few_shot = evaluate_predictions(
     df_evals.copy(),
     target_column = "label_text",
-    prediction_column = "gem1.0-zero-shot_predictions",
+    prediction_column = "gem1.0-few-shot_predictions",
     postprocessing = True
 )
-print(metrics_zero_shot)
+print(metrics_few_shot)
 
 
+# Log Experiment with zero-shot prompt with Gemini 1.0 pro
+params = {
+    "model": "gemini-1.0-pro-002",
+    "adaptation_type": "in-context few-shot",
+    "temperature": 0,
+    "max_output_tokens": 10,
+}
 
-
+experiment_manager.log_run(
+    run_name="gemini-1-0-pro-002-few-shot",
+    params=params,
+    metrics=metrics_few_shot
+)
