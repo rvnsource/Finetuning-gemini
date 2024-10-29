@@ -7,13 +7,16 @@ from typing import Optional, List, Callable, Any, Dict
 import vertexai
 import os
 from datasets import load_dataset
+from google.api_core.exceptions import ResourceExhausted
 from sklearn.metrics import classification_report, f1_score, precision_score, recall_score
 from tqdm import tqdm
 import pandas as pd
 from google.cloud import aiplatform
+import multiprocess as mp
 
 from sklearn.model_selection import train_test_split
 from vertexai.generative_models import GenerationConfig, HarmCategory, HarmBlockThreshold, GenerativeModel
+import backoff
 
 # %%
 #######################
@@ -67,6 +70,24 @@ INSTRUCTIONS
 - Analyze the text carefully before choosing the best-fitting category.
 """
 
+system_prompt_few_shot = f"""TASK:
+Classify the text into ONLY one of the following classes [business, entertainment, politics, sport, tech].
+
+CLASSES:
+- business
+- entertainment
+- politics
+- sport
+- tech
+
+EXAMPLES:
+- EXAMPLE 1:
+    <user>
+    {train.loc[train["label_text"] == "business", "text"].iloc[10]}
+    <model>
+    {train.loc[train["label_text"] == "business", "label_text"].iloc[10]}
+"""
+
 # %%
 ######################
 # Model Configuration
@@ -87,32 +108,57 @@ gem_pro_1_model_zero = GenerativeModel(
 )
 
 # %%
-######################
-# Prediction Functions
-######################
-def _predict_message(message: str, model: GenerativeModel) -> Optional[str]:
-    try:
-        response = model.generate_content([message], stream=False)
-        response_dict = response.to_dict()
+####################################################
+# Utility Functions for Batch Prediction
+####################################################
+def backoff_hdlr(details) -> None:
+    print(f"Backing off {details['wait']} seconds after {details['tries']} tries.")
 
-        # Handle prohibited content if necessary
+def log_error(msg: str, *args: Any):
+    mp.get_logger().error(msg, *args)
+    raise Exception(msg)
+
+def handle_exception_threading(f: Callable) -> Callable:
+    def applicator(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except Exception as e:
+            log_error(traceback.format_exc())
+    return applicator
+
+@handle_exception_threading
+@backoff.on_exception(
+    backoff.expo, ResourceExhausted, max_tries=30, on_backoff=backoff_hdlr
+)
+def _predict_message(message: str, model: GenerativeModel) -> Optional[str]:
+    response = model.generate_content([message], stream=False)
+    response_dict = response.to_dict()
+
+    try:
         prompt_feedback = response_dict.get("prompt_feedback", {})
         block_reason = prompt_feedback.get("block_reason")
 
         if block_reason == "PROHIBITED_CONTENT":
             print(f"Blocked message: {message} - Reason: {response.prompt_feedback.block_reason_message}")
             return response.prompt_feedback.block_reason_message
-
         return response.text
     except Exception as e:
-        print(f"Error during prediction: {e}")
+        print(f"An error occurred: {e}")
         return None
 
+# %%
+######################
+# Sequential Prediction
+######################
 def batch_predict_sequential(messages: List[str], model: GenerativeModel) -> List[Optional[str]]:
     predictions = []
     for message in tqdm(messages, total=len(messages), desc="Processing Messages"):
-        prediction = _predict_message(message, model)
-        predictions.append(prediction)
+        try:
+            prediction = _predict_message(message, model)
+            predictions.append(prediction)
+        except Exception as e:
+            print(f"Error during prediction: {e}")
+            predictions.append(None)
     return predictions
 
 # %%
